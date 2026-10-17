@@ -131,6 +131,114 @@ El estado `APROBADO` impreso por el script representa el criterio de aceptación
 - `reports/` no está excluida por las reglas indicadas aquí; revisa `.gitignore` y la política de datos antes de versionar los informes.
 - Para reproducir los resultados, usa los mismos datos y las mismas versiones de dependencias.
 
+
+### 12. Estrategia de monitorización, deriva de datos y reentrenamiento
+
+La solución actual implementa un flujo reproducible de entrenamiento por lotes y generación de predicciones. Como primer paso hacia un entorno de producción, se propone la siguiente estrategia de monitorización y reentrenamiento.
+
+### 13. Monitorización de la calidad y la deriva de los datos
+
+Los nuevos lotes de datos deben validarse antes de generar predicciones. La validación incluye comprobar el esquema de características esperado, los tipos de datos numéricos, los valores faltantes y los valores no finitos.
+
+La deriva de datos (*data drift*) puede monitorizarse comparando las distribuciones de las 20 variables de entrada con las de un conjunto de referencia. Las medidas estadísticas y basadas en distribuciones, como el Índice de Estabilidad de la Población (*Population Stability Index*, PSI), permiten identificar cambios que requieren investigación. Los umbrales iniciales deben considerarse provisionales y calibrarse utilizando datos representativos.
+
+La detección de deriva no implica necesariamente una degradación del modelo. Los cambios en la distribución de las predicciones también se monitorizan como señales de alerta, pero no constituyen una medida directa de la precisión del modelo.
+
+#### Monitorización del rendimiento del modelo
+
+Cuando estén disponibles los valores reales de la variable objetivo, las predicciones deben asociarse con sus correspondientes valores reales para calcular métricas de regresión como RMSE, MAE y R².
+
+Si los valores reales de la variable objetivo no están disponibles, no es posible medir directamente los errores reales de las predicciones. Aun así, se pueden monitorizar la deriva de las variables de entrada y los cambios en la distribución de las predicciones, aunque estos indicadores no permiten confirmar una pérdida de precisión del modelo.
+
+#### Reentrenamiento y aprobación de modelos
+
+Se puede considerar el reentrenamiento cuando se observe una degradación del rendimiento en datos etiquetados suficientemente representativos, o cuando se produzcan cambios relevantes en los datos que justifiquen una nueva evaluación.
+
+Un modelo candidato debe evaluarse frente al modelo actualmente aprobado utilizando un conjunto de validación independiente y criterios de aceptación definidos previamente. Únicamente deben incorporarse los modelos candidatos que cumplan estos criterios. Se deben conservar las versiones de los modelos, los resultados de las evaluaciones y la posibilidad de volver a la versión anterior.
+
+#### Mejoras futuras
+
+Como trabajo futuro, se contempla la generación automatizada de informes de deriva, la monitorización programada, el seguimiento de experimentos y la gestión de versiones de modelos mediante MLflow, así como la implementación de un flujo controlado de reentrenamiento.
+
+En la implementación actual no se habilita el reentrenamiento automático basado exclusivamente en la detección de deriva de datos.
+
+### 14. Monitorización de deriva y evaluación de estrategias de reentrenamiento
+
+#### Monitorización de deriva de datos (Data Drift)
+
+Se incorporó `src/drift_monitoring.py`, que implementa la clase `DataDriftMonitor` para comparar las distribuciones de las variables predictoras entre un conjunto de referencia y uno reciente mediante el índice **Population Stability Index (PSI)**.
+
+El monitor:
+
+- Carga los conjuntos de datos de referencia y recientes.
+- Excluye la columna objetivo `target` de ambos conjuntos, cuando está presente, para analizar únicamente las variables predictoras.
+- Valida que ambos conjuntos tengan observaciones, que no existan columnas duplicadas y que coincida el esquema de características.
+- Comprueba que las variables sean numéricas y que no contengan valores faltantes o no finitos.
+- Define los intervalos del PSI a partir de los cuantiles del conjunto de referencia.
+- Clasifica cada variable de acuerdo con los umbrales configurados y guarda el resultado en un CSV.
+
+Los umbrales predeterminados son:
+
+| PSI | Clasificación |
+|---|---|
+| PSI < 0.20 | `SIN_ALERTA` |
+| 0.20 ≤ PSI < 0.30 | `INVESTIGAR` |
+| PSI ≥ 0.30 | `ALERTA` |
+
+Estos umbrales son valores de referencia configurables, no reglas universales. El PSI detecta cambios en la distribución de las variables de entrada; por sí solo no demuestra una degradación del modelo ni mide el error predictivo.
+
+#### Integración con el reentrenamiento
+
+Se amplió `src/retrain.py` para ejecutar el análisis de deriva antes de entrenar y comparar las estrategias candidatas. La comparación del drift usa:
+
+- **Referencia:** `data/training_data.csv`.
+- **Datos recientes etiquetados:** `data/new_labeled_data.csv`.
+- **Informe de drift:** `reports/retraining_drift_psi.csv`.
+
+El resultado de drift es diagnóstico: no bloquea el entrenamiento, no selecciona automáticamente una estrategia y no reemplaza el modelo vigente.
+
+#### Estrategias de reentrenamiento evaluadas
+
+El script compara el modelo vigente con tres estrategias:
+
+1. **`historico_mas_nuevos`:** entrena con los datos históricos y los nuevos.
+2. **`solo_nuevos_recientes`:** entrena con la fracción final de los nuevos registros, asumiendo que las filas están ordenadas cronológicamente.
+3. **`historico_ponderado`:** combina los datos históricos y nuevos, asignando mayor peso a los registros recientes.
+
+La evaluación se realiza con `data/retraining_evaluation.csv`, un conjunto etiquetado separado que no se utiliza para ajustar los candidatos. Se calculan RMSE, MAE, R² y error medio. Para que esta comparación tenga valor real, el conjunto de evaluación debe ser independiente y contar con etiquetas reales representativas del uso esperado.
+
+Los candidatos se guardan por separado en `models/candidates/`. El script genera `reports/retraining_comparison.csv` y `reports/retraining_comparison.json`. **El modelo aprobado no se reemplaza automáticamente**; la promoción requiere una revisión posterior de las métricas y de los criterios de aceptación.
+
+#### Integración en el cuaderno
+
+El cuaderno `orquestador_entrenamiento_prediccion.ipynb` se amplió con una sección para ejecutar el flujo de prueba de drift y reentrenamiento con los datos sintéticos:
+
+1. Comprueba que existan `src/retrain.py` y los dos CSV sintéticos.
+2. Ejecuta el script de reentrenamiento con los argumentos correspondientes.
+3. Comprueba la generación de los informes de drift y comparación.
+4. Carga y muestra ambos informes dentro del cuaderno.
+
+La función auxiliar `run_script()` admite argumentos adicionales, conservando su uso previo en las etapas existentes. La nueva sección es adicional al flujo principal de entrenamiento, monitorización del conjunto ciego y generación de predicciones.
+
+#### Prueba técnica con datos sintéticos
+
+Se probó el flujo con `data/new_labeled_data.csv` y `data/retraining_evaluation.csv`. En la ejecución de prueba, el PSI señaló `feature_5` (aprox. 0.228) y `feature_14` (aprox. 0.201) como `INVESTIGAR`; las otras 18 variables quedaron por debajo de 0.20. No hubo variables con estado `ALERTA`.
+
+En la comparación sobre el conjunto sintético de evaluación, el modelo vigente obtuvo un RMSE aproximado de 1.740; los candidatos obtuvieron RMSE aproximados de 2.072 (`historico_mas_nuevos`), 2.092 (`historico_ponderado`) y 3.329 (`solo_nuevos_recientes`). Estos valores documentan una ejecución técnica concreta y pueden variar si cambian los datos o la configuración.
+
+**Limitación importante:** los dos CSV usados en esta prueba contienen datos sintéticos. Los resultados comprueban que el flujo se ejecuta y produce informes, pero no demuestran que exista drift real ni permiten concluir qué estrategia funcionará mejor en producción.
+
+#### Archivos e informes generados
+
+| Archivo | Propósito |
+|---|---|
+| `reports/data_drift_psi.csv` | Informe PSI del monitor de drift utilizado en el flujo principal. |
+| `reports/retraining_drift_psi.csv` | Informe PSI entre el histórico y los nuevos datos etiquetados. |
+| `reports/retraining_comparison.csv` | Métricas del modelo vigente y de los candidatos. |
+| `reports/retraining_comparison.json` | Metadatos y advertencia sobre la promoción manual. |
+| `models/candidates/` | Modelos candidatos guardados sin reemplazar el modelo aprobado. |
+
+
 ---
 
 ## English
@@ -259,3 +367,106 @@ The `APROBADO` status printed by the script represents the acceptance criterion 
 - `models/` and `outputs/` are ignored by Git because they contain generated artifacts.
 - `reports/` is not excluded by the rules described here; review `.gitignore` and your data policy before versioning reports.
 - For reproducibility, use the same data and dependency versions.
+
+### 12. Monitoring, Data Drift and Retraining Strategy
+
+The current solution implements a reproducible batch-training and prediction workflow. As a first step toward production readiness, the following monitoring and retraining strategy is proposed.
+
+#### Data quality and drift monitoring
+
+Incoming prediction batches must be validated before inference. Validation includes checking the expected feature schema, numeric data types, missing values, and non-finite values.
+
+Data drift can be monitored by comparing the distributions of the 20 input features against a reference dataset. Statistical and distribution-based measures, such as the Population Stability Index (PSI), can help identify changes that require investigation. Initial thresholds must be treated as provisional and calibrated using representative data.
+
+A detected drift does not necessarily imply model degradation. Prediction distribution changes are also monitored as warning signals, not as direct measures of prediction accuracy.
+
+#### Model performance monitoring
+
+When ground-truth target values become available, predictions must be matched with their corresponding actual values to calculate regression metrics such as RMSE, MAE, and R².
+
+If target values are unavailable, actual prediction errors cannot be measured directly. Input and prediction drift can still be monitored, but these indicators cannot confirm a loss of model accuracy.
+
+#### Retraining and model promotion
+
+Retraining may be considered when performance degradation is observed on sufficiently representative labeled data, or when meaningful changes in the data justify a new evaluation.
+
+A candidate model must be evaluated against the currently approved model using an independent validation dataset and predefined acceptance criteria. Only candidates that satisfy these criteria should be promoted. Model versions, evaluation results, and the ability to revert to the previous version should be preserved.
+
+#### Future improvements
+
+Future work may include automated drift reports, scheduled monitoring, experiment tracking and model version management with MLflow, and a controlled retraining pipeline. Automatic retraining based solely on drift detection is not enabled in the current implementation.
+
+
+### 14. Data drift monitoring
+
+`src/drift_monitoring.py` introduces the `DataDriftMonitor` class to compare predictor distributions between a reference dataset and a recent dataset using the **Population Stability Index (PSI)**.
+
+The monitor:
+
+- Loads the reference and recent datasets.
+- Excludes the `target` column from both datasets when present, so the analysis focuses on predictors.
+- Validates that both datasets contain observations, have no duplicate columns, and share the same feature schema.
+- Checks that features are numeric and contain no missing or non-finite values.
+- Builds PSI bins from the reference dataset's quantiles.
+- Assigns a status to each feature using configurable thresholds and writes the results to a CSV report.
+
+Default thresholds:
+
+| PSI | Status |
+|---|---|
+| PSI < 0.20 | `SIN_ALERTA` (no alert) |
+| 0.20 ≤ PSI < 0.30 | `INVESTIGAR` (investigate) |
+| PSI ≥ 0.30 | `ALERTA` (alert) |
+
+These are configurable reference thresholds, not universal rules. PSI detects changes in input-feature distributions; by itself, it does not establish model degradation or measure predictive error.
+
+#### Integration with retraining
+
+`src/retrain.py` was extended to run drift analysis before training and comparing candidate strategies. The drift comparison uses:
+
+- **Reference dataset:** `data/training_data.csv`.
+- **Recent labeled data:** `data/new_labeled_data.csv`.
+- **Drift report:** `reports/retraining_drift_psi.csv`.
+
+The drift result is diagnostic only: it does not block training, automatically choose a strategy, or replace the current approved model.
+
+#### Retraining strategies
+
+The script compares the current model with three strategies:
+
+1. **`historico_mas_nuevos`:** train on historical and new labeled data.
+2. **`solo_nuevos_recientes`:** train on the final fraction of new records, assuming rows are chronologically ordered.
+3. **`historico_ponderado`:** combine historical and new data while assigning greater weight to recent records.
+
+Models are evaluated on `data/retraining_evaluation.csv`, a separate labeled dataset that is not used to fit the candidates. The script calculates RMSE, MAE, R², and mean error. For a meaningful real-world comparison, the evaluation set must be independent and contain genuine labels representative of the intended use case.
+
+Candidate models are saved separately under `models/candidates/`. The script generates `reports/retraining_comparison.csv` and `reports/retraining_comparison.json`. **The approved model is not replaced automatically**; promotion requires a subsequent review of the metrics and acceptance criteria.
+
+#### Notebook integration
+
+The notebook `orquestador_entrenamiento_prediccion.ipynb` was extended with a section that runs the drift and retraining test using synthetic data:
+
+1. Checks that `src/retrain.py` and both synthetic CSV files exist.
+2. Runs the retraining script with the required arguments.
+3. Checks that the drift and model-comparison reports were created.
+4. Loads and displays both reports in the notebook.
+
+The helper function `run_script()` now accepts additional command-line arguments while preserving its previous use in existing stages. This new section supplements the main training, blind-test drift monitoring, and prediction workflow.
+
+#### Synthetic-data smoke test
+
+The workflow was tested with `data/new_labeled_data.csv` and `data/retraining_evaluation.csv`. In the recorded test run, PSI marked `feature_5` (approximately 0.228) and `feature_14` (approximately 0.201) as `INVESTIGAR` (investigate); the remaining 18 features were below 0.20. No feature reached the `ALERTA` threshold.
+
+On the synthetic evaluation set, the current model achieved an RMSE of approximately 1.740. Candidate RMSE values were approximately 2.072 (`historico_mas_nuevos`), 2.092 (`historico_ponderado`), and 3.329 (`solo_nuevos_recientes`). These values document one technical test run and may change with different data or settings.
+
+**Important limitation:** both CSV files used in this test contain synthetic data. The results confirm that the workflow runs and generates reports, but they do not demonstrate real data drift or establish which strategy would perform best in production.
+
+#### Generated files and reports
+
+| File | Purpose |
+|---|---|
+| `reports/data_drift_psi.csv` | PSI report from the drift monitor used in the main workflow. |
+| `reports/retraining_drift_psi.csv` | PSI report comparing historical and new labeled data. |
+| `reports/retraining_comparison.csv` | Metrics for the current model and candidate models. |
+| `reports/retraining_comparison.json` | Metadata and reminder that model promotion is manual. |
+| `models/candidates/` | Candidate models saved without replacing the approved model. |
